@@ -1,5 +1,7 @@
 import numpy as np
 
+from ..constants import OMEGA_EARTH
+
 
 def cross_product_matrix(v: np.ndarray) -> np.ndarray:
     return np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
@@ -7,10 +9,13 @@ def cross_product_matrix(v: np.ndarray) -> np.ndarray:
 
 def A_from_q(q: np.ndarray) -> np.ndarray:
     norm = np.linalg.norm(q)
-    q /= norm
+    if norm == 0.0:
+        raise ValueError("Quaternion must be non-zero.")
 
-    w = q[0]
-    v = q[1:]
+    q_unit = q / norm
+
+    w = q_unit[0]
+    v = q_unit[1:]
 
     return (
         np.eye(3) * (w * w - np.dot(v, v))
@@ -36,11 +41,14 @@ def euler_from_A(A: np.ndarray) -> tuple[np.ndarray, float]:
 
 def q_from_euler(axis: np.ndarray, angle: float) -> np.ndarray:
     norm = np.linalg.norm(axis)
-    axis /= norm
+    if norm == 0.0:
+        raise ValueError("Rotation axis must be non-zero.")
+
+    axis_unit = axis / norm
 
     half_angle = angle / 2.0
     w = np.cos(half_angle)
-    xyz = axis * np.sin(half_angle)
+    xyz = axis_unit * np.sin(half_angle)
     return np.array([w, xyz[0], xyz[1], xyz[2]])
 
 
@@ -64,3 +72,11 @@ def angle_between_vectors(v1: np.ndarray, v2: np.ndarray) -> float:
     v1_u = v1 / np.linalg.norm(v1)
     v2_u = v2 / np.linalg.norm(v2)
     return np.degrees(np.arccos(np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)))
+
+
+def eci_to_ecef(position_eci_km: np.ndarray, time_s: float) -> np.ndarray:
+    theta = OMEGA_EARTH * time_s
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    x, y, z = position_eci_km
+    return np.array([cos_t * x + sin_t * y, -sin_t * x + cos_t * y, z])

@@ -1,6 +1,9 @@
 import numpy as np
 import json
-from ..dynamics.ode_solvers import position_rk4_step, attitude_rk4_step
+
+from ..dynamics.ode_solvers import combined_rk4_step
+from .components.power import SolarPanelArray
+from .components.surfaces import BodySurfaceModel
 
 
 """
@@ -23,25 +26,14 @@ class Satellite:
         self.omega = np.zeros(3)  # rad/s (body frame)
 
         self.mass = 1.0
-        self.drag_coefficient = 2.2
         self.J = np.diag([0.0027, 0.0027, 0.0054])
         self.J_inv = np.linalg.inv(self.J)
 
-        # 3D structure (in body frame)
-        self.n = np.array(
-            [
-                [1.0, 0.0, 0.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, -1.0, 0.0],
-                [0.0, 0.0, 1.0],
-                [0.0, 0.0, -1.0],
-            ]
-        )
-        self.A = np.array([0.01, 0.01, 0.01, 0.01, 0.1, 0.1])  # m^2
-        self.solarp_area = np.array([0.006, 0.006, 0.006, 0.006, 0.006, 0.006])  # m^2
-        self.drag_coefficient = 2.2  # TODO fix to actual value
         self.time = 0.0
+        self.components = []
+        self.monitors = []
+        self.add_component(BodySurfaceModel())
+        self.add_component(SolarPanelArray())
 
         # TODO antenna parameters
         """
@@ -50,17 +42,91 @@ class Satellite:
         Can also do Data Rate calculations later
         """
 
+    @property
+    def n(self):
+        return self.get_component("body_surfaces").normals_body
+
+    @property
+    def A(self):
+        return self.get_component("body_surfaces").drag_areas_m2
+
+    @property
+    def solarp_area(self):
+        return self.get_component("solar_panels").areas_m2
+
+    @property
+    def drag_coefficient(self):
+        return self.get_component("body_surfaces").drag_coefficient
+
+    def add_component(self, component):
+        name = getattr(component, "name", None)
+        if not isinstance(name, str) or not name:
+            raise ValueError("Component must define a non-empty string name.")
+
+        if self.get_component(name, default=None) is not None:
+            raise ValueError(f"Component with name {name!r} already exists.")
+
+        if hasattr(component, "attach"):
+            component.attach(self)
+
+        self.components.append(component)
+        return component
+
+    def get_component(self, name, default=...):
+        for component in self.components:
+            if getattr(component, "name", None) == name:
+                return component
+
+        if default is ...:
+            raise KeyError(f"No component named {name!r}.")
+        return default
+
+    def get_components(self, component_type=None):
+        if component_type is None:
+            return list(self.components)
+        return [
+            component
+            for component in self.components
+            if isinstance(component, component_type)
+        ]
+
+    def add_monitor(self, monitor):
+        name = getattr(monitor, "name", None)
+        if not isinstance(name, str) or not name:
+            raise ValueError("Monitor must define a non-empty string name.")
+        if not callable(getattr(monitor, "sample", None)):
+            raise ValueError("Monitor must define a callable sample(sat) method.")
+
+        if self.get_monitor(name, default=None) is not None:
+            raise ValueError(f"Monitor with name {name!r} already exists.")
+
+        if hasattr(monitor, "attach"):
+            monitor.attach(self)
+
+        self.monitors.append(monitor)
+        return monitor
+
+    def get_monitor(self, name, default=...):
+        for monitor in self.monitors:
+            if getattr(monitor, "name", None) == name:
+                return monitor
+
+        if default is ...:
+            raise KeyError(f"No monitor named {name!r}.")
+        return default
+
     def propagate(self, dt: float):
-        pos = position_rk4_step(self.time, self, dt)
-        att = attitude_rk4_step(self.time, self, dt)
+        state = combined_rk4_step(self.time, self, dt)
 
-        self.position = pos[:3]
-        self.velocity = pos[3:6]
-
-        self.quaternion = att[:4]
-        self.omega = att[4:]
+        self.position = state[:3]
+        self.velocity = state[3:6]
+        self.quaternion = state[6:10]
+        self.omega = state[10:]
 
         self.time += dt
+
+        for monitor in self.monitors:
+            monitor.sample(self)
 
     def load_from_file(self, fp):
         """Load initial conditions from a json file"""

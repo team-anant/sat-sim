@@ -32,7 +32,12 @@ def density_lookup(position_km: np.ndarray) -> float:
     return rho0 * np.exp(-(altitude_m - base_alt) / scale_height)
 
 
-def acc_drag(position_km: np.ndarray, velocity_km_s: np.ndarray, sat) -> np.ndarray:
+def acc_drag(
+    position_km: np.ndarray,
+    velocity_km_s: np.ndarray,
+    sat,
+    quaternion: np.ndarray | None = None,
+) -> np.ndarray:
     """Compute atmospheric drag acceleration (km/s^2)."""
 
     rho = density_lookup(position_km)
@@ -56,21 +61,21 @@ def acc_drag(position_km: np.ndarray, velocity_km_s: np.ndarray, sat) -> np.ndar
         return np.zeros(3)
 
     # Transform relative velocity to body frame
-    A = A_from_q(sat.quaternion)  # ECI -> body
+    if quaternion is None:
+        quaternion = sat.quaternion
+
+    A = A_from_q(quaternion)  # ECI -> body
     v_rel_body = A @ v_rel_eci
     v_hat_body = v_rel_body / np.linalg.norm(v_rel_body)
 
-    # Effective cross-sectional area
-    n_hat = sat.n
-    proj = n_hat @ (-v_hat_body)
-    mask = proj > 0.0
-    A_eff = np.sum(proj[mask] * sat.A[mask])
+    surface_model = sat.get_component("body_surfaces")
+    A_eff = surface_model.projected_drag_area(v_hat_body)
 
     if A_eff <= 0.0:
         return np.zeros(3)
 
     # Drag force (ECI frame)
-    F_drag_eci = -0.5 * rho * sat.drag_coefficient * A_eff * speed * v_rel_eci
+    F_drag_eci = -0.5 * rho * surface_model.drag_coefficient * A_eff * speed * v_rel_eci
 
     # Acceleration in km/s^2
     a_drag_km_s2 = F_drag_eci / sat.mass / 1_000.0

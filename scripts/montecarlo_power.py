@@ -1,17 +1,24 @@
-import numpy as np
-from src import Satellite
-from src.maths.quaternions import Quaternion
-import json
+from pathlib import Path
+import sys
 
-SOLAR_CONSTANT = 1361
-SOLAR_PANEL_EFFICIENCY = 0.2
-R_EARTH = 6371.0
-R_SUN = 696340.0
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import numpy as np
+
+from src import Satellite
+from src.analysis.attitude import BodyAxisAlignmentMonitor
+from src.analysis.solarpower import SolarPowerMonitor
+from src.simulation.orbit import CircularOrbit
+from src.utils.initial_conditions import (
+    generate_inclined_circular_orbit,
+    random_quaternion,
+)
 
 ALTITUDE_KM = 400
 RADIUS_KM = 6371 + ALTITUDE_KM
 INCLINATION_DEG = 60
-MU = 398600.4418
 
 NUM_SIMULATIONS = 500
 ORBIT_PERIOD_MINUTES = 92.5
@@ -19,58 +26,7 @@ TOTAL_TIME = ORBIT_PERIOD_MINUTES * 60
 DT = 10
 
 
-def generate_inclined_orbit(
-    inclination_deg: float,
-    radius_km: float,
-    raan_deg: float = None,
-    arg_lat_deg: float = None,
-    rng: np.random.Generator = None,
-):
-    if rng is None:
-        rng = np.random.default_rng()
-
-    if raan_deg is None:
-        raan_deg = rng.uniform(0, 360)
-
-    if arg_lat_deg is None:
-        arg_lat_deg = rng.uniform(0, 360)
-
-    inc = np.radians(inclination_deg)
-    raan = np.radians(raan_deg)
-    arg_lat = np.radians(arg_lat_deg)
-
-    r_orbital = radius_km * np.array([np.cos(arg_lat), np.sin(arg_lat), 0])
-
-    v_mag = np.sqrt(MU / radius_km)
-
-    v_orbital = v_mag * np.array([-np.sin(arg_lat), np.cos(arg_lat), 0])
-
-    R_raan = np.array(
-        [[np.cos(raan), -np.sin(raan), 0], [np.sin(raan), np.cos(raan), 0], [0, 0, 1]]
-    )
-
-    R_inc = np.array(
-        [[1, 0, 0], [0, np.cos(inc), -np.sin(inc)], [0, np.sin(inc), np.cos(inc)]]
-    )
-
-    R = R_raan @ R_inc
-
-    r_eci = R @ r_orbital
-    v_eci = R @ v_orbital
-
-    return r_eci, v_eci
-
-
-def random_quaternion(rng: np.random.Generator = None):
-    if rng is None:
-        rng = np.random.default_rng()
-
-    q = rng.normal(size=4)
-    q = q / np.linalg.norm(q)
-    return q
-
-
-def simulate_orbit(
+def run_power_case(
     initial_r,
     initial_v,
     initial_q,
@@ -80,99 +36,34 @@ def simulate_orbit(
     total_time: float,
     dt: float,
 ):
-    from src.maths.maths import Omega
+    power_monitor = SolarPowerMonitor(sun_position_km=r_sun)
+    face_alignment = BodyAxisAlignmentMonitor(
+        name="body_x_eci_x_alignment",
+        body_axis=np.array([1.0, 0.0, 0.0]),
+        reference_axis_eci=np.array([1.0, 0.0, 0.0]),
+    )
+    sat_template.add_monitor(power_monitor)
+    sat_template.add_monitor(face_alignment)
 
-    steps = int(total_time / dt)
-    powers = []
-    eclipse_steps = 0
-    face_aligns = []
+    sat_template.position = initial_r.copy()
+    sat_template.velocity = initial_v.copy()
+    sat_template.quaternion = initial_q.copy()
+    sat_template.omega = initial_omega.copy()
 
-    r_mag = np.linalg.norm(initial_r)
-    v_mag = np.linalg.norm(initial_v)
+    orbit = CircularOrbit.from_satellite(sat_template)
+    orbit.simulate(sat_template, total_time, dt)
 
-    n = v_mag / r_mag
-
-    h = np.cross(initial_r, initial_v)
-    h_hat = h / np.linalg.norm(h)
-    r_hat = initial_r / r_mag
-    v_hat = np.cross(h_hat, r_hat)
-
-    q = initial_q.copy()
-    omega = initial_omega.copy()
-
-    for step in range(steps):
-        t = step * dt
-
-        theta = n * t
-        r = r_mag * (np.cos(theta) * r_hat + np.sin(theta) * v_hat)
-
-        q_dot = 0.5 * Omega(omega) @ q
-        q = q + q_dot * dt
-        q = q / np.linalg.norm(q)
-
-        quat = Quaternion(*q)
-
-        r_sat_sun = r_sun - r
-
-        r_norm = np.linalg.norm(r)
-        r_sun_norm = np.linalg.norm(r_sat_sun)
-
-        sin_theta_earth = min(1.0, R_EARTH / r_norm)
-        sin_theta_sun = min(1.0, R_SUN / r_sun_norm)
-
-        theta_earth = np.arcsin(sin_theta_earth)
-        theta_sun = np.arcsin(sin_theta_sun)
-
-        cos_phi = np.dot(r, r_sat_sun) / (r_norm * r_sun_norm)
-        cos_phi = np.clip(cos_phi, -1, 1)
-        phi = np.arccos(cos_phi)
-
-        sun_dir = r_sun / np.linalg.norm(r_sun)
-
-        r_proj = np.dot(r, sun_dir)
-
-        r_perp = np.sqrt(r_norm**2 - r_proj**2)
-
-        in_eclipse = (r_proj < 0) and (r_perp < R_EARTH)
-
-        if in_eclipse:
-            power = 0.0
-            eclipse_steps += 1
-        else:
-            sun_dir_eci = r_sat_sun / r_sun_norm
-            sun_dir_body = quat.rotate_vector(sun_dir_eci)
-
-            power = 0.0
-            for i in range(len(sat_template.n)):
-                cos_angle = np.dot(sat_template.n[i], sun_dir_body)
-                if cos_angle > 0:
-                    power += (
-                        SOLAR_CONSTANT
-                        * SOLAR_PANEL_EFFICIENCY
-                        * sat_template.solarp_area[i]
-                        * cos_angle
-                    )
-
-        powers.append(power)
-
-        eci_x = np.array([1.0, 0.0, 0.0])
-        body_x_eci = quat.rotate_vector(np.array([1.0, 0.0, 0.0]))
-        face_align = np.dot(eci_x, body_x_eci)
-        face_aligns.append(abs(face_align))
-
-    powers = np.array(powers)
-    eclipse_fraction = eclipse_steps / steps
-    average_face_align = np.mean(face_aligns)
+    powers = np.array(power_monitor.powers)
 
     return {
-        "mean_power": np.mean(powers),
-        "max_power": np.max(powers),
-        "min_power": np.min(powers),
-        "eclipse_fraction": eclipse_fraction,
+        "mean_power": power_monitor.mean_power,
+        "max_power": power_monitor.max_power,
+        "min_power": power_monitor.min_power,
+        "eclipse_fraction": power_monitor.eclipse_fraction,
         "powers": powers,
         "initial_quaternion": initial_q.copy(),
         "initial_omega": initial_omega.copy(),
-        "average_face_align": average_face_align,
+        "average_face_align": face_alignment.mean_alignment,
     }
 
 
@@ -183,22 +74,21 @@ def run_monte_carlo():
 
     results = []
 
-    sat_template = Satellite()
-
     print(f"Running Monte Carlo simulation with {NUM_SIMULATIONS} orbits...")
-    print(f"Altitude: {ALTITUDE_KM} km, Inclination: {INCLINATION_DEG}°")
+    print(f"Altitude: {ALTITUDE_KM} km, Inclination: {INCLINATION_DEG} deg")
     print(f"Simulating {TOTAL_TIME/60:.1f} minutes per orbit with dt={DT}s")
     print("-" * 70)
 
     for i in range(NUM_SIMULATIONS):
-        r, v = generate_inclined_orbit(
+        r, v = generate_inclined_circular_orbit(
             inclination_deg=INCLINATION_DEG, radius_km=RADIUS_KM, rng=rng
         )
 
         q = random_quaternion(rng)
         omega = rng.normal(size=3) * 0.01
 
-        result = simulate_orbit(r, v, q, omega, sat_template, r_sun, TOTAL_TIME, DT)
+        sat_template = Satellite()
+        result = run_power_case(r, v, q, omega, sat_template, r_sun, TOTAL_TIME, DT)
         result["raan"] = np.degrees(np.arctan2(r[1], r[0]))
         result["orbit_index"] = i
 
@@ -291,7 +181,7 @@ def analyze_results(results):
         for r in results
     ]
     correlation_yz = np.corrcoef(omega_yz_mags, normalized_powers)[0, 1]
-    print(f"Correlation (Normalized Power vs sqrt(ωy² + ωz²)): {correlation_yz:.4f}")
+    print(f"Correlation (Normalized Power vs sqrt(omega_y^2 + omega_z^2)): {correlation_yz:.4f}")
 
     return {
         "overall_mean": overall_mean,
@@ -314,7 +204,6 @@ def plot_results(results):
     ]
     face_aligns = [r["average_face_align"] for r in results]
     eclipse_fractions = [r["eclipse_fraction"] * 100 for r in results]
-    face_aligns = [r["average_face_align"] for r in results]
 
     best_idx = np.argmax(normalized_powers)
     worst_idx = np.argmin(normalized_powers)
@@ -420,7 +309,7 @@ def plot_results(results):
     fig1.update_yaxes(title_text="Power (W)", row=2, col=2)
 
     fig1.update_layout(
-        title=f"Monte Carlo Solar Power Analysis ({NUM_SIMULATIONS} orbits, {ALTITUDE_KM}km, {INCLINATION_DEG}° inc)",
+        title=f"Monte Carlo Solar Power Analysis ({NUM_SIMULATIONS} orbits, {ALTITUDE_KM}km, {INCLINATION_DEG} deg inc)",
         showlegend=True,
         height=800,
     )
@@ -438,7 +327,7 @@ def plot_results(results):
             x=omega_yz_mags,
             y=normalized_powers,
             mode="markers",
-            name="Normalized Power vs sqrt(ωy² + ωz²)",
+            name="Normalized Power vs sqrt(omega_y^2 + omega_z^2)",
             marker=dict(
                 color=eclipse_fractions,
                 colorscale="RdYlGn_r",
@@ -467,10 +356,10 @@ def plot_results(results):
         )
     )
 
-    fig2.update_xaxes(title_text="sqrt(ωy² + ωz²) (rad/s)")
+    fig2.update_xaxes(title_text="sqrt(omega_y^2 + omega_z^2) (rad/s)")
     fig2.update_yaxes(title_text="Normalized Mean Power (W)")
     fig2.update_layout(
-        title="Normalized Mean Power vs sqrt(ωy² + ωz²)",
+        title="Normalized Mean Power vs sqrt(omega_y^2 + omega_z^2)",
         showlegend=True,
     )
 
