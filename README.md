@@ -1,4 +1,4 @@
-# orbit-propagator-3d
+# sat-sim
 
 Orbit propagation and spacecraft analysis sandbox for simulating satellite state, attachable spacecraft hardware, and monitor-based analyses such as solar power and TTC contact.
 
